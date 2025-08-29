@@ -205,7 +205,7 @@ impl GpuCtx {
         let bind_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("bind-layout"),
             entries: &[
-                // 0: params
+                // 0: params（storage, read）
                 wgpu::BindGroupLayoutEntry {
                     binding: 0,
                     visibility: wgpu::ShaderStages::COMPUTE,
@@ -216,7 +216,7 @@ impl GpuCtx {
                     },
                     count: None,
                 },
-                // 1: const data
+                // 1: const data（storage, read）
                 wgpu::BindGroupLayoutEntry {
                     binding: 1,
                     visibility: wgpu::ShaderStages::COMPUTE,
@@ -227,18 +227,19 @@ impl GpuCtx {
                     },
                     count: None,
                 },
-                // 2: round keys (mont)
+                // 2: round keys（**统一改为 UNIFORM**）
                 wgpu::BindGroupLayoutEntry {
                     binding: 2,
                     visibility: wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        ty: wgpu::BufferBindingType::Uniform,
                         has_dynamic_offset: false,
-                        min_binding_size: None,
+                        // 可选：声明最小大小（438*16 字节）
+                        min_binding_size: Some(std::num::NonZeroU64::new(438 * 16).unwrap()),
                     },
                     count: None,
                 },
-                // 3: hits counter
+                // 3: hits counter（storage, rw）
                 wgpu::BindGroupLayoutEntry {
                     binding: 3,
                     visibility: wgpu::ShaderStages::COMPUTE,
@@ -249,7 +250,7 @@ impl GpuCtx {
                     },
                     count: None,
                 },
-                // 4: hits array
+                // 4: hits（storage, rw）
                 wgpu::BindGroupLayoutEntry {
                     binding: 4,
                     visibility: wgpu::ShaderStages::COMPUTE,
@@ -262,6 +263,7 @@ impl GpuCtx {
                 },
             ],
         });
+        
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("pipe-layout"),
@@ -325,17 +327,15 @@ fn gpu_mine(
 
     // 轮常数：标准 -> mont
     let rk_fr = round_keys_contants_to_vec::<Fr>(&MIMC_5_220_BN254_ROUND_KEYS);
-    let rk_mont_u32x8: Vec<[u32; 8]> = rk_fr
-        .iter()
-        .map(|c| {
-            let c_std = BigUint::from_bytes_be(&c.into_repr().to_bytes_be());
-            to_mont_u32x8(&c_std, &r_big, &p_big)
-        })
-        .collect();
-
-    // key=7（mont）
-    let key_mont = to_mont_u32x8(&BigUint::from_u64(7).unwrap(), &r_big, &p_big);
-
+    let k_std = BigUint::from_u64(7).unwrap();
+    let rk_plus_k_mont_u32x8: Vec<[u32; 8]> = rk_fr.iter().map(|c| {
+        let c_std = BigUint::from_bytes_be(&c.into_repr().to_bytes_be());
+        let sum_std = (&k_std + &c_std) % &p_big;           // 在标准域相加
+        to_mont_u32x8(&sum_std, &r_big, &p_big)             // 再转到 mont
+    }).collect();
+    
+    // key（mont）仍然需要，供最后一轮使用
+    let key_mont = to_mont_u32x8(&k_std, &r_big, &p_big);
     let params = ParamsGpu {
         base_x: base_x as i32,
         base_y: base_y as i32,
@@ -371,14 +371,14 @@ fn gpu_mine(
     });
 
     // round keys 展平
-    let mut rk_flat = Vec::<u32>::with_capacity(8 * rk_mont_u32x8.len());
-    for w in &rk_mont_u32x8 {
+    let mut rk_flat = Vec::<u32>::with_capacity(8 * rk_plus_k_mont_u32x8.len());
+    for w in &rk_plus_k_mont_u32x8 {
         rk_flat.extend_from_slice(w);
     }
     let rk_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("rk"),
         contents: bytemuck::cast_slice::<u32, u8>(&rk_flat),
-        usage: wgpu::BufferUsages::STORAGE,
+        usage: wgpu::BufferUsages::UNIFORM,
     });
 
     // 输出缓冲
@@ -403,26 +403,11 @@ fn gpu_mine(
         label: Some("bind"),
         layout: &ctx.bind_layout,
         entries: &[
-            wgpu::BindGroupEntry {
-                binding: 0,
-                resource: params_buf.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 1,
-                resource: cdata_buf.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 2,
-                resource: rk_buf.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 3,
-                resource: hits_counter_buf.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 4,
-                resource: hits_buf.as_entire_binding(),
-            },
+            wgpu::BindGroupEntry { binding: 0, resource: params_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 1, resource: cdata_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 2, resource: rk_buf.as_entire_binding() }, // ← UNIFORM
+            wgpu::BindGroupEntry { binding: 3, resource: hits_counter_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 4, resource: hits_buf.as_entire_binding() },
         ],
     });
 
@@ -437,49 +422,58 @@ fn gpu_mine(
         cpass.dispatch_workgroups(work, 1, 1);
     }
 
-    // 读回
+    queue.submit(Some(encoder.finish()));
+
+    // 1) 等 counter
     let counter_read = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("counter-read"),
         size: 4,
         usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
         mapped_at_creation: false,
     });
-    encoder.copy_buffer_to_buffer(&hits_counter_buf, 0, &counter_read, 0, 4);
-
-    let hits_read = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("hits-read"),
-        size: hits_buf_size,
-        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-        mapped_at_creation: false,
-    });
-    encoder.copy_buffer_to_buffer(&hits_buf, 0, &hits_read, 0, hits_buf_size);
-
-    queue.submit(Some(encoder.finish()));
-
-    // 等待映射（wgpu 0.19: 回调 + poll）
+    let mut enc_counter = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+    enc_counter.copy_buffer_to_buffer(&hits_counter_buf, 0, &counter_read, 0, 4);
+    queue.submit(Some(enc_counter.finish()));
     {
         let slice = counter_read.slice(..);
         let (s, r) = oneshot_channel();
-        slice.map_async(wgpu::MapMode::Read, move |res| {
-            s.send(res).ok();
-        });
+        slice.map_async(wgpu::MapMode::Read, move |res| { s.send(res).ok(); });
         device.poll(wgpu::Maintain::Wait);
-
         pollster::block_on(r.receive()).unwrap().unwrap();
     }
     let hit_count: u32 = {
-        let data = counter_read.slice(..).get_mapped_range();
-        let arr = bytemuck::from_bytes::<u32>(&data);
-        *arr
+        let view = counter_read.slice(..).get_mapped_range();
+        *bytemuck::from_bytes::<u32>(&view)
     };
     counter_read.unmap();
 
+    // 2) 只按命中数量拷回 hits
+    // 读完 counter 之后：
+    let hit_size_bytes = (std::mem::size_of::<i32>() * 2 + 32) as u64; // 40 字节
+    let used = (hit_count as u64) * hit_size_bytes;
+
+    // 命中为 0：直接返回空
+    if used == 0 {
+        return Ok(Vec::new());
+    }
+
+    // 只按命中数量回读 hits（注意：没有 .max(1) 了）
+    let hits_read = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("hits-read"),
+        size: used,
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+
+    let mut enc_hits = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+    enc_hits.copy_buffer_to_buffer(&hits_buf, 0, &hits_read, 0, used);
+    queue.submit(Some(enc_hits.finish()));
+
+    // 映射等待
     {
         let slice = hits_read.slice(..);
         let (s, r) = oneshot_channel();
-        slice.map_async(wgpu::MapMode::Read, move |res| {
-            s.send(res).ok();
-        });
+        slice.map_async(wgpu::MapMode::Read, move |res| { s.send(res).ok(); });
         device.poll(wgpu::Maintain::Wait);
         pollster::block_on(r.receive()).unwrap().unwrap();
     }
@@ -489,26 +483,20 @@ fn gpu_mine(
     // 解析前 hit_count 条
     let mut out = Vec::with_capacity(hit_count as usize);
     for i in 0..(hit_count as usize) {
-        let offset = i * hit_size_bytes;
-        let x = i32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as i64;
-        let y = i32::from_le_bytes(data[offset + 4..offset + 8].try_into().unwrap()) as i64;
+        let off = (i as u64 * hit_size_bytes) as usize;
+        let x = i32::from_le_bytes(data[off..off+4].try_into().unwrap()) as i64;
+        let y = i32::from_le_bytes(data[off+4..off+8].try_into().unwrap()) as i64;
         let mut limbs = [0u32; 8];
         for j in 0..8 {
-            let s = offset + 8 + j * 4;
-            limbs[j] = u32::from_le_bytes(data[s..s + 4].try_into().unwrap());
+            let s = off + 8 + j*4;
+            limbs[j] = u32::from_le_bytes(data[s..s+4].try_into().unwrap());
         }
         let mut bytes = Vec::with_capacity(32);
-        for j in 0..8 {
-            bytes.extend_from_slice(&limbs[j].to_le_bytes());
-        }
+        for j in 0..8 { bytes.extend_from_slice(&limbs[j].to_le_bytes()); }
         let n = BigUint::from_bytes_le(&bytes);
-        out.push(Planet {
-            coords: Coords { x, y },
-            hash: n.to_string(),
-        });
+        out.push(Planet { coords: Coords { x, y }, hash: n.to_string() });
     }
-
-    Ok(out)
+    return Ok(out);
 }
 
 // ----------------------- Rocket 集成 -----------------------
