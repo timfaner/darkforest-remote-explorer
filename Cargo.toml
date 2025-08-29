@@ -1,6 +1,6 @@
 [package]
-name = "mimc-miner"
-version = "0.1.0"
+name = "mimc_miner_server"
+version = "0.2.0"
 edition = "2021"
 
 [profile.release]
@@ -14,14 +14,22 @@ panic = "abort"
 rocket = { version = "0.5", features = ["json"] }
 rocket_cors = "0.6"
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 
-# 并行 & 辅助
+# CPU 路径
 rayon = "1.8"
 itertools = "0.12"
 once_cell = "1.19"
 num-bigint = "0.4"
+num-traits = "0.2"
 
-# arkworks & MiMC（注意版本配套：arkworks-mimc 0.3.* 绑定 ark-* 0.3.*）
-arkworks-mimc = { version = "0.3", default-features = false, features = ["mimc-5-220-bn254"] }
 ark-bn254 = "0.3"
 ark-ff = "0.3"
+arkworks-mimc = { version = "0.3", default-features = false, features = ["mimc-5-220-bn254"] }
+
+# GPU 路径
+wgpu = "0.19"
+pollster = "0.3"
+futures-intrusive = "0.5"
+anyhow = "1"
+bytemuck = { version = "1", features = ["derive"] }
