@@ -1,0 +1,27 @@
+[package]
+name = "mimc-miner"
+version = "0.1.0"
+edition = "2021"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+opt-level = 3
+panic = "abort"
+
+[dependencies]
+# Web
+rocket = { version = "0.5", features = ["json"] }
+rocket_cors = "0.6"
+serde = { version = "1", features = ["derive"] }
+
+# 并行 & 辅助
+rayon = "1.8"
+itertools = "0.12"
+once_cell = "1.19"
+num-bigint = "0.4"
+
+# arkworks & MiMC（注意版本配套：arkworks-mimc 0.3.* 绑定 ark-* 0.3.*）
+arkworks-mimc = { version = "0.3", default-features = false, features = ["mimc-5-220-bn254"] }
+ark-bn254 = "0.3"
+ark-ff = "0.3"
