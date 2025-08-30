@@ -7,9 +7,9 @@ struct Params {
   };
   
   struct ConstData {
-    modulus:   array<u32, 8>,   // 仍走 storage（省去 uniform 对齐麻烦）
+    modulus:   array<u32, 8>,
     r2:        array<u32, 8>,
-    key_mont:  array<u32, 8>,   // 仅用于最后一轮 (k + l)
+    key_mont:  array<u32, 8>,   // 仅用于最后一轮 t = k + l
     threshold: array<u32, 8>,
     inv32:     u32,
     _pad3:     u32, _pad4: u32, _pad5: u32,
@@ -17,20 +17,26 @@ struct Params {
   
   struct Hit { x: i32, y: i32, hash: array<u32, 8>, };
   
-// 219 轮常数（已在 host 侧把 k+C[i] 合并），以 uniform 提供
-struct RoundKeys { data: array<vec4<u32>, 438>, };
-
-  
+  // 219 轮，每轮 8 limb => 2×vec4
+  struct RoundKeys { data: array<vec4<u32>, 438>, };
   struct Counter { value: atomic<u32>, };
   struct Hits    { data: array<Hit>, };
   
   @group(0) @binding(0) var<storage, read>        params: Params;
   @group(0) @binding(1) var<storage, read>        cdata:  ConstData;
-  @group(0) @binding(2) var<uniform>              rk_mont: RoundKeys;   // ← uniform
+  @group(0) @binding(2) var<uniform>              rk_mont: RoundKeys;
   @group(0) @binding(3) var<storage, read_write>  hits_counter: Counter;
   @group(0) @binding(4) var<storage, read_write>  hits: Hits;
   
-  // ---- 32x32->64：无丢进位版 ----
+  // ================== 本地聚合缓冲（方案 A） ==================
+  const WG_CAP: u32 = 64u; // 每个 workgroup 聚合的最大命中数
+  const WG_HASH_LEN: u32 = 512u; // 64 * 8
+  var<workgroup> wg_cnt: atomic<u32>;
+  var<workgroup> wg_x: array<i32, WG_CAP>;
+  var<workgroup> wg_y: array<i32, WG_CAP>;
+  var<workgroup> wg_hash: array<u32, WG_HASH_LEN>;
+  
+  // ================== 算术工具 ==================
   fn umul32(a: u32, b: u32) -> vec2<u32> {
     let a0 = a & 0xFFFFu; let a1 = a >> 16u;
     let b0 = b & 0xFFFFu; let b1 = b >> 16u;
@@ -99,7 +105,7 @@ struct RoundKeys { data: array<vec4<u32>, 438>, };
     return out;
   }
   
-  // ---- CIOS Montgomery，修正 carry_hi 累计 ----
+  // CIOS Montgomery 乘法（修正 carry_hi 汇总）
   fn mont_mul(a: array<u32, 8>, b: array<u32, 8>) -> array<u32, 8> {
     var aa: array<u32, 8>; var bb: array<u32, 8>;
     aa[0]=a[0]; aa[1]=a[1]; aa[2]=a[2]; aa[3]=a[3]; aa[4]=a[4]; aa[5]=a[5]; aa[6]=a[6]; aa[7]=a[7];
@@ -109,7 +115,6 @@ struct RoundKeys { data: array<vec4<u32>, 438>, };
     for (var k: u32 = 0u; k < 16u; k = k + 1u) { t[k] = 0u; }
   
     for (var i: u32 = 0u; i < 8u; i = i + 1u) {
-      // ---- 累加 a[i]*b ----
       var carry_lo: u32 = 0u; var carry_hi: u32 = 0u;
       for (var j: u32 = 0u; j < 8u; j = j + 1u) {
         let prod = umul32(aa[i], bb[j]);
@@ -136,7 +141,6 @@ struct RoundKeys { data: array<vec4<u32>, 438>, };
         cprop  = cprop - 1u + c3;
       }
   
-      // ---- 约减：加 m_i * p ----
       let mi = t[i] * cdata.inv32;
       carry_lo = 0u; carry_hi = 0u;
       for (var j: u32 = 0u; j < 8u; j = j + 1u) {
@@ -192,7 +196,6 @@ struct RoundKeys { data: array<vec4<u32>, 438>, };
     let x2 = mont_mul(x, x); let x4 = mont_mul(x2, x2); return mont_mul(x4, x);
   }
   
-  // 从 uniform 的 vec4 阵列里取出第 i 轮的 8×u32（已是 (k+C[i]) in Mont）
   fn load_rk(i: u32) -> array<u32, 8> {
     var out: array<u32, 8>;
     let base = i * 2u;
@@ -203,8 +206,15 @@ struct RoundKeys { data: array<vec4<u32>, 438>, };
     return out;
   }
   
+  // ================== Kernel ==================
   @compute @workgroup_size(128)
-  fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  fn main(
+    @builtin(global_invocation_id) gid: vec3<u32>,
+    @builtin(local_invocation_index) li: u32
+  ) {
+    if (li == 0u) { atomicStore(&wg_cnt, 0u); }
+    workgroupBarrier();
+  
     let idx = i32(gid.x);
     let n   = params.side * params.side;
     if (idx >= n) { return; }
@@ -217,14 +227,12 @@ struct RoundKeys { data: array<vec4<u32>, 438>, };
   
     // 注入 x
     l = add_mod(l, i64_to_mont(xi));
-    // 前 rounds-1 轮：t = l + (k + C[i])
     for (var i: u32 = 0u; i < params.rounds - 1u; i = i + 1u) {
-      let t = add_mod(l, load_rk(i));
+      let t = add_mod(l, load_rk(i));       // (k + C[i]) 已在 host 侧合并
       let ln = add_mod(pow5(t), r);
       r = l; l = ln;
     }
-    // 最后一轮：t = k + l
-    var t = add_mod(cdata.key_mont, l);
+    var t = add_mod(cdata.key_mont, l);     // 最后一轮用 k + l
     r = add_mod(pow5(t), r);
   
     // 注入 y
@@ -237,10 +245,62 @@ struct RoundKeys { data: array<vec4<u32>, 438>, };
     var t3 = add_mod(cdata.key_mont, l);
     r = add_mod(pow5(t3), r);
   
-    let h_std = from_mont(l);
+    let tmp = from_mont(l);
+
+    // 重要：把临时数组拷进本地 var，避免对 let 数组做动态索引
+    var h_std: array<u32, 8>;
+    h_std[0]=tmp[0]; h_std[1]=tmp[1]; h_std[2]=tmp[2]; h_std[3]=tmp[3];
+    h_std[4]=tmp[4]; h_std[5]=tmp[5]; h_std[6]=tmp[6]; h_std[7]=tmp[7];
+    
     if (lt256(h_std, cdata.threshold)) {
-      let w = atomicAdd(&hits_counter.value, 1u);
-      hits.data[w].x = xi; hits.data[w].y = yi; hits.data[w].hash = h_std;
+      let slot = atomicAdd(&wg_cnt, 1u);
+      if (slot < WG_CAP) {
+        wg_x[slot] = xi;
+        wg_y[slot] = yi;
+        let base = slot * 8u;
+        // 展开 8 次写，避免 h_std[j]
+        wg_hash[base + 0u] = h_std[0];
+        wg_hash[base + 1u] = h_std[1];
+        wg_hash[base + 2u] = h_std[2];
+        wg_hash[base + 3u] = h_std[3];
+        wg_hash[base + 4u] = h_std[4];
+        wg_hash[base + 5u] = h_std[5];
+        wg_hash[base + 6u] = h_std[6];
+        wg_hash[base + 7u] = h_std[7];
+      } else {
+        // 溢出直写全局：也展开 8 次
+        let w = atomicAdd(&hits_counter.value, 1u);
+        hits.data[w].x = xi;
+        hits.data[w].y = yi;
+        hits.data[w].hash[0] = h_std[0];
+        hits.data[w].hash[1] = h_std[1];
+        hits.data[w].hash[2] = h_std[2];
+        hits.data[w].hash[3] = h_std[3];
+        hits.data[w].hash[4] = h_std[4];
+        hits.data[w].hash[5] = h_std[5];
+        hits.data[w].hash[6] = h_std[6];
+        hits.data[w].hash[7] = h_std[7];
+      }
+    }
+  
+    workgroupBarrier();
+  
+    // Flush：仅 Li=0 线程批量落盘
+    if (li == 0u) {
+      var count = atomicLoad(&wg_cnt);
+      if (count > WG_CAP) { count = WG_CAP; }
+      if (count > 0u) {
+        let base = atomicAdd(&hits_counter.value, count);
+        for (var s: u32 = 0u; s < count; s = s + 1u) {
+          let dst = base + s;
+          hits.data[dst].x = wg_x[s];
+          hits.data[dst].y = wg_y[s];
+          let off = s * 8u;
+          for (var j: u32 = 0u; j < 8u; j = j + 1u) {
+            hits.data[dst].hash[j] = wg_hash[off + j];
+          }
+        }
+      }
     }
   }
   

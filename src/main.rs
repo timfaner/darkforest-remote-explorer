@@ -172,6 +172,7 @@ struct GpuCtx {
     queue: wgpu::Queue,
     pipeline: wgpu::ComputePipeline,
     bind_layout: wgpu::BindGroupLayout,
+    rk_buf: wgpu::Buffer,    // ← 新增：常驻 uniform
 }
 
 impl GpuCtx {
@@ -205,7 +206,7 @@ impl GpuCtx {
         let bind_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("bind-layout"),
             entries: &[
-                // 0: params（storage, read）
+                // 0: params (storage, read)
                 wgpu::BindGroupLayoutEntry {
                     binding: 0,
                     visibility: wgpu::ShaderStages::COMPUTE,
@@ -216,7 +217,7 @@ impl GpuCtx {
                     },
                     count: None,
                 },
-                // 1: const data（storage, read）
+                // 1: const data (storage, read)
                 wgpu::BindGroupLayoutEntry {
                     binding: 1,
                     visibility: wgpu::ShaderStages::COMPUTE,
@@ -227,19 +228,18 @@ impl GpuCtx {
                     },
                     count: None,
                 },
-                // 2: round keys（**统一改为 UNIFORM**）
+                // 2: round keys (uniform)
                 wgpu::BindGroupLayoutEntry {
                     binding: 2,
                     visibility: wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Uniform,
                         has_dynamic_offset: false,
-                        // 可选：声明最小大小（438*16 字节）
-                        min_binding_size: Some(std::num::NonZeroU64::new(438 * 16).unwrap()),
+                        min_binding_size: None,
                     },
                     count: None,
                 },
-                // 3: hits counter（storage, rw）
+                // 3: hits counter (storage, rw)
                 wgpu::BindGroupLayoutEntry {
                     binding: 3,
                     visibility: wgpu::ShaderStages::COMPUTE,
@@ -250,7 +250,7 @@ impl GpuCtx {
                     },
                     count: None,
                 },
-                // 4: hits（storage, rw）
+                // 4: hits array (storage, rw)
                 wgpu::BindGroupLayoutEntry {
                     binding: 4,
                     visibility: wgpu::ShaderStages::COMPUTE,
@@ -263,7 +263,6 @@ impl GpuCtx {
                 },
             ],
         });
-        
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("pipe-layout"),
@@ -277,13 +276,45 @@ impl GpuCtx {
             module: &shader,
             entry_point: "main",
         });
+                // ====== 常驻上传 (k + C[i])（标准域相加后转 Mont），作为 uniform ======
+        use ark_bn254::FrParameters;
+        use arkworks_mimc::{params::mimc_5_220_bn254::MIMC_5_220_BN254_ROUND_KEYS, params::round_keys_contants_to_vec};
+        use ark_ff::{PrimeField, BigInteger, FpParameters};
+        use num_bigint::BigUint;
+        use num_traits::FromPrimitive;
 
-        Ok(Self {
-            device,
-            queue,
-            pipeline,
-            bind_layout,
-        })
+        let p_big = BigUint::from_bytes_be(&FrParameters::MODULUS.to_bytes_be());
+        let r_big = BigUint::from_bytes_be(&FrParameters::R.to_bytes_be());
+        let rk_fr = round_keys_contants_to_vec::<ark_bn254::Fr>(&MIMC_5_220_BN254_ROUND_KEYS);
+        let k_std = BigUint::from_u64(7).unwrap();
+
+        fn bytes_le_to_u32x8(mut le: Vec<u8>) -> [u32; 8] {
+            le.resize(32, 0);
+            let mut out = [0u32; 8];
+            for i in 0..8 { out[i] = u32::from_le_bytes(le[i*4..i*4+4].try_into().unwrap()); }
+            out
+        }
+        fn biguint_to_u32x8(n: &BigUint) -> [u32; 8] { bytes_le_to_u32x8(n.to_bytes_le()) }
+        fn to_mont_u32x8(val_std: &BigUint, r_mod_p: &BigUint, p: &BigUint) -> [u32; 8] {
+            biguint_to_u32x8(&((val_std * r_mod_p) % p))
+        }
+
+        let rk_plus_k_mont: Vec<[u32; 8]> = rk_fr.iter().map(|c| {
+            let c_std = BigUint::from_bytes_be(&c.into_repr().to_bytes_be());
+            let sum_std = (&k_std + &c_std) % &p_big;    // 标准域加
+            to_mont_u32x8(&sum_std, &r_big, &p_big)      // 转 Mont
+        }).collect();
+
+        let mut rk_flat = Vec::<u32>::with_capacity(8 * rk_plus_k_mont.len());
+        for w in &rk_plus_k_mont { rk_flat.extend_from_slice(w); }
+
+        let rk_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("rk_plus_k_uniform"),
+            contents: bytemuck::cast_slice::<u32, u8>(&rk_flat),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+
+        Ok(Self { device, queue, pipeline, bind_layout, rk_buf })
     }
 }
 
@@ -405,7 +436,7 @@ fn gpu_mine(
         entries: &[
             wgpu::BindGroupEntry { binding: 0, resource: params_buf.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 1, resource: cdata_buf.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 2, resource: rk_buf.as_entire_binding() }, // ← UNIFORM
+            wgpu::BindGroupEntry { binding: 2, resource: ctx.rk_buf.as_entire_binding() }, // ← 复用
             wgpu::BindGroupEntry { binding: 3, resource: hits_counter_buf.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 4, resource: hits_buf.as_entire_binding() },
         ],
